@@ -8,6 +8,7 @@ AUTHORIZED USE ONLY — for authorized red team engagements.
 
 import argparse
 import json
+import secrets
 import socket
 import struct
 import sys
@@ -33,28 +34,141 @@ def check_port(host: str, port: int, timeout: float = 5) -> bool:
     except Exception:
         return False
 
+def _encode_dns_name(name: str) -> bytes:
+    labels = name.rstrip(".").split(".")
+    encoded = bytearray()
+    for label in labels:
+        wire_label = label.encode("idna")
+        if not wire_label or len(wire_label) > 63:
+            raise ValueError("Invalid DNS label length")
+        encoded.append(len(wire_label))
+        encoded.extend(wire_label)
+    encoded.append(0)
+    if len(encoded) > 255:
+        raise ValueError("DNS name is too long")
+    return bytes(encoded)
+
+def _decode_dns_name(message: bytes, offset: int) -> tuple[str, int]:
+    labels = []
+    cursor = offset
+    next_offset = None
+    visited = set()
+    wire_length = 1
+
+    while True:
+        if cursor >= len(message):
+            raise ValueError("Truncated DNS name")
+        length = message[cursor]
+        if length & 0xC0 == 0xC0:
+            if cursor + 1 >= len(message):
+                raise ValueError("Truncated DNS compression pointer")
+            pointer = ((length & 0x3F) << 8) | message[cursor + 1]
+            if pointer >= cursor or pointer in visited:
+                raise ValueError("Invalid DNS compression pointer")
+            visited.add(pointer)
+            if next_offset is None:
+                next_offset = cursor + 2
+            cursor = pointer
+            continue
+        if length & 0xC0:
+            raise ValueError("Invalid DNS label encoding")
+        cursor += 1
+        if length == 0:
+            if next_offset is None:
+                next_offset = cursor
+            break
+        if length > 63 or cursor + length > len(message):
+            raise ValueError("Truncated DNS label")
+        wire_length += length + 1
+        if wire_length > 255:
+            raise ValueError("DNS name is too long")
+        try:
+            labels.append(message[cursor:cursor + length].decode("idna"))
+        except UnicodeError as exc:
+            raise ValueError("Invalid DNS label encoding") from exc
+        cursor += length
+
+    return ".".join(labels).lower(), next_offset
+
+def _build_dns_srv_query(name: str, transaction_id: int = 1) -> bytes:
+    header = struct.pack("!HHHHHH", transaction_id, 0x0100, 1, 0, 0, 0)
+    question = _encode_dns_name(name) + struct.pack("!HH", 33, 1)
+    return header + question
+
+def _parse_dns_srv_response(
+    response: bytes, expected_name: str, domain: str, transaction_id: int = 1
+) -> list[str]:
+    if len(response) < 12:
+        raise ValueError("Truncated DNS header")
+    response_id, flags, question_count, answer_count, _, _ = struct.unpack(
+        "!HHHHHH", response[:12]
+    )
+    if response_id != transaction_id:
+        raise ValueError("DNS transaction ID mismatch")
+    if not flags & 0x8000 or flags & 0x7800:
+        raise ValueError("Invalid DNS response")
+    if flags & 0x0200:
+        raise ValueError("Truncated DNS response")
+    if flags & 0x000F:
+        raise ValueError(f"DNS server returned response code {flags & 0x000F}")
+    if question_count != 1:
+        raise ValueError("Unexpected DNS question count")
+    expected_name, _ = _decode_dns_name(_encode_dns_name(expected_name), 0)
+    domain, _ = _decode_dns_name(_encode_dns_name(domain), 0)
+
+    offset = 12
+    question_name, offset = _decode_dns_name(response, offset)
+    if offset + 4 > len(response):
+        raise ValueError("Truncated DNS question")
+    question_type, question_class = struct.unpack("!HH", response[offset:offset + 4])
+    offset += 4
+    if (question_name, question_type, question_class) != (
+        expected_name.rstrip(".").lower(), 33, 1
+    ):
+        raise ValueError("DNS question does not match SRV query")
+
+    expected_owner = expected_name
+    targets = []
+    for _ in range(answer_count):
+        owner, offset = _decode_dns_name(response, offset)
+        if offset + 10 > len(response):
+            raise ValueError("Truncated DNS answer")
+        record_type, record_class, _, data_length = struct.unpack(
+            "!HHIH", response[offset:offset + 10]
+        )
+        offset += 10
+        data_end = offset + data_length
+        if data_end > len(response):
+            raise ValueError("Truncated DNS answer data")
+
+        if record_type == 33 and record_class == 1 and owner == expected_owner:
+            if data_length < 7:
+                raise ValueError("Invalid DNS SRV record")
+            target, target_end = _decode_dns_name(response, offset + 6)
+            if target_end != data_end:
+                raise ValueError("Invalid DNS SRV target length")
+            if target and (target == domain or target.endswith("." + domain)):
+                targets.append(target)
+        offset = data_end
+    return targets
+
 def discover_dcs_via_dns(domain: str) -> list[str]:
     """Query _ldap._tcp.dc._msdcs SRV record to find DCs."""
     dcs = []
     for prefix in [f"_ldap._tcp.dc._msdcs.{domain}", f"_kerberos._tcp.dc._msdcs.{domain}"]:
         try:
-            # Use raw socket + manual DNS query for SRV (no external deps)
-            import struct
-            srv_name  = b"".join(len(p).to_bytes(1, "big") + p.encode() for p in prefix.split(".")) + b"\x00"
-            query     = b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + srv_name + b"\x00\x21\x00\x01"
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.settimeout(5)
-            sock.sendto(query, ("8.8.8.8", 53))
-            resp = sock.recv(512)
-            sock.close()
-            # Just try to extract hostnames from the response (simplified)
-            for part in resp.decode(errors="ignore").split("\x00"):
-                part = part.strip()
-                if part.endswith(f".{domain}") or (len(part) > 4 and domain in part):
-                    dcs.append(part)
-        except Exception:
-            pass
-    return list(set(dcs))
+            transaction_id = secrets.randbits(16)
+            query = _build_dns_srv_query(prefix, transaction_id)
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(5)
+                sock.sendto(query, ("8.8.8.8", 53))
+                response = sock.recv(4096)
+            dcs.extend(
+                _parse_dns_srv_response(response, prefix, domain, transaction_id)
+            )
+        except (OSError, ValueError) as exc:
+            print(f"[!] DNS SRV query failed for {prefix}: {exc}", file=sys.stderr)
+    return list(dict.fromkeys(dcs))
 
 def discover_dcs_via_nbt(subnet_prefix: str) -> list[str]:
     """Broadcast NetBIOS Name Service query to find DCs (within local subnet)."""
